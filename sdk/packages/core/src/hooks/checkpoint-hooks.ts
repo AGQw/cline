@@ -7,7 +7,8 @@ import type { AgentHooks, BasicLogger, ITelemetryService } from "@cline/shared";
 import { resolveClineDataDir } from "@cline/shared/storage";
 import { countUserRunMessages } from "../session/user-run-messages";
 import {
-	createCheckpointExcludes,
+	CHECKPOINT_EXCLUSIONS_VERSION,
+	resolveCheckpointExcludes,
 	type WithCheckpointExcludes,
 } from "./checkpoint-exclusions";
 
@@ -86,6 +87,12 @@ export interface CheckpointEntry {
 	createdAt: number;
 	runCount: number;
 	kind?: "stash" | "commit";
+	/**
+	 * Version of the default exclusion list the checkpoint was made with (see
+	 * CHECKPOINT_EXCLUSIONS_VERSION). Absent on checkpoints that captured every
+	 * untracked file.
+	 */
+	exclusions?: number;
 }
 
 export interface CheckpointMetadata {
@@ -531,10 +538,6 @@ export function createCheckpointHooks(
 	// to undefined — so the durable persisted checkpoint history is what
 	// actually prevents duplicate/overwriting checkpoints.
 	let rootRunMessageStart: number | undefined;
-	// Exclusions apply from the next snapshot on, in new and ongoing sessions
-	// alike; restore handles checkpoints made either way (checkpoint-restore).
-	const withExcludes = createCheckpointExcludes(options.cwd);
-
 	const ensureGitRepository = async (): Promise<boolean> => {
 		// Only cache the positive answer: a cwd that is not a git repo can
 		// become one mid-session (the user runs `git init`), and this probe
@@ -604,6 +607,7 @@ export function createCheckpointHooks(
 					createdAt: Date.now(),
 					runCount,
 					kind: "commit",
+					exclusions: CHECKPOINT_EXCLUSIONS_VERSION,
 				};
 			} catch (error) {
 				warn(
@@ -617,6 +621,13 @@ export function createCheckpointHooks(
 		const message = `${CHECKPOINT_STASH_MESSAGE_PREFIX}${options.sessionId} run=${runCount}`;
 		let ref = "";
 		try {
+			// Exclusions apply from the next snapshot on, in new and ongoing
+			// sessions alike. Every entry written below carries the marker, so
+			// restore and compare can tell these checkpoints from older ones.
+			const withExcludes = await resolveCheckpointExcludes(
+				options.cwd,
+				CHECKPOINT_EXCLUSIONS_VERSION,
+			);
 			ref =
 				(await createWorktreeStashCommit(
 					options.cwd,
@@ -669,6 +680,7 @@ export function createCheckpointHooks(
 			createdAt: Date.now(),
 			runCount,
 			kind: "stash",
+			exclusions: CHECKPOINT_EXCLUSIONS_VERSION,
 		};
 	};
 

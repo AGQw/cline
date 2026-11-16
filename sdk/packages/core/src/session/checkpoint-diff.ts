@@ -2,6 +2,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { resolveCheckpointExcludes } from "../hooks/checkpoint-exclusions";
 import type { CheckpointEntry } from "../hooks/checkpoint-hooks";
 import type { SessionRecord } from "../types/sessions";
 import {
@@ -196,10 +197,24 @@ export async function buildCheckpointWorkspaceDiff(
 ): Promise<CheckpointContentDiff[]> {
 	const { ref } = checkpoint;
 	await runGit(cwd, ["cat-file", "-e", `${ref}^{tree}`]);
+	// Untracked files the checkpoint's exclusion list skipped are not in the
+	// snapshot; listing them would report every untouched one as newly added.
+	const withExcludes = await resolveCheckpointExcludes(
+		cwd,
+		checkpoint.exclusions,
+	);
 	const [trackedChanges, untrackedOutput, checkpointUntracked] =
 		await Promise.all([
 			listTrackedChanges(cwd, ref),
-			runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]),
+			withExcludes((excludeArgs) =>
+				runGit(cwd, [
+					...excludeArgs,
+					"ls-files",
+					"--others",
+					"--exclude-standard",
+					"-z",
+				]),
+			),
 			listCheckpointUntrackedBlobs(cwd, ref),
 		]);
 	const changedPaths = [

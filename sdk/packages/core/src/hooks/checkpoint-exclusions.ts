@@ -1,7 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(execFileCallback);
@@ -16,6 +16,10 @@ const execFile = promisify(execFileCallback);
  * config/env, and geospatial formats are also left out pending a product
  * decision. ML model and array formats are added: they are the likeliest
  * multi-gigabyte untracked files in agent workspaces.
+ *
+ * Changing this list means bumping CHECKPOINT_EXCLUSIONS_VERSION and keeping
+ * the previous list resolvable: a checkpoint has to be restored with the list
+ * it was made with.
  */
 export const CHECKPOINT_DEFAULT_EXCLUDES: readonly string[] = [
 	// Build output and dependency trees. Directory patterns also stop git from
@@ -144,19 +148,19 @@ export const CHECKPOINT_DEFAULT_EXCLUDES: readonly string[] = [
 ];
 
 /**
- * Patterns the repository routes through Git LFS. Untracked matches are
- * skipped like the defaults: they are large by definition, and adding them to
- * the snapshot index would run the LFS clean filter — slow, and a hard failure
- * where git-lfs is required but not installed.
+ * Recorded on every checkpoint made with CHECKPOINT_DEFAULT_EXCLUDES, as
+ * `CheckpointEntry.exclusions`. Restore and compare must apply the list a
+ * checkpoint was made with: with a longer list they would leave a captured
+ * file in place and fail to re-create it, with a shorter one they would treat
+ * a skipped file as created afterwards and delete it.
  */
-export function parseLfsPatterns(gitattributes: string): string[] {
-	return gitattributes
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter((line) => line && !line.startsWith("#"))
-		.filter((line) => /(^|\s)filter=lfs(\s|$)/.test(line))
-		.map((line) => line.split(/\s+/)[0] ?? "")
-		.filter(Boolean);
+export const CHECKPOINT_EXCLUSIONS_VERSION = 1;
+
+/** Reads the `exclusions` marker off a stored checkpoint entry. */
+export function readCheckpointExclusions(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 1
+		? value
+		: undefined;
 }
 
 async function gitOutput(
@@ -186,6 +190,25 @@ function defaultUserExcludesPath(): string {
 	return join(xdgConfigHome || join(homedir(), ".config"), "git", "ignore");
 }
 
+async function readUserExcludes(cwd: string): Promise<string> {
+	const configured = await gitOutput(cwd, [
+		"config",
+		"--path",
+		"--get",
+		"core.excludesFile",
+	]);
+	if (!configured) {
+		return readOptional(defaultUserExcludesPath());
+	}
+	if (isAbsolute(configured)) {
+		return readOptional(configured);
+	}
+	// Git reads a relative path from the top of the worktree; this process
+	// usually runs somewhere else.
+	const repoRoot = await gitOutput(cwd, ["rev-parse", "--show-toplevel"]);
+	return readOptional(resolve(repoRoot ?? cwd, configured));
+}
+
 /** Git accepts forward slashes everywhere; config values avoid escape rules. */
 function toGitPath(path: string): string {
 	return process.platform === "win32" ? path.replace(/\\/g, "/") : path;
@@ -196,43 +219,40 @@ export type WithCheckpointExcludes = <T>(
 ) => Promise<T>;
 
 /**
- * Returns a runner that hands git config args making every checkpoint git
- * command — the untracked listing, the restore safety stash, and cleanup —
- * treat the default and LFS patterns as ignored. Sharing one mechanism is what
- * keeps snapshot and restore consistent: a file the snapshot skips is one
- * restore neither deletes nor moves into its discarded safety stash.
+ * Returns a runner that hands git the config args under which every git
+ * command of one checkpoint operation — the snapshot's untracked listing, the
+ * restore safety stash and cleanups, the compare listing — treats the
+ * exclusion list as ignored. A file the snapshot skipped is then one that
+ * restore neither deletes nor moves into its discarded safety stash, and that
+ * compare does not report as new.
+ *
+ * `version` is the checkpoint's `exclusions` marker. Checkpoints without one
+ * captured every untracked file and get no extra args, so they behave exactly
+ * as they did before exclusions existed.
  *
  * The patterns reach git as `core.excludesFile`, which replaces the user's own
- * setting for that command, so the user's file is merged in first. File
- * contents are re-read on each call (edits apply to the next snapshot); the
- * repository root and the user's excludes path are resolved once per runner.
+ * setting for that command, so the user's file is merged in. The rules are
+ * read once here and reused by every command the runner wraps: commands of
+ * one restore must agree on what is ignored even though the restore rewrites
+ * tracked files between them.
  */
-export function createCheckpointExcludes(cwd: string): WithCheckpointExcludes {
-	let locations:
-		| Promise<{ repoRoot: string; userExcludes: string }>
-		| undefined;
-	const resolveLocations = () => {
-		locations ??= Promise.all([
-			gitOutput(cwd, ["rev-parse", "--show-toplevel"]),
-			gitOutput(cwd, ["config", "--path", "--get", "core.excludesFile"]),
-		]).then(([repoRoot, userExcludes]) => ({
-			repoRoot: repoRoot ?? cwd,
-			userExcludes: userExcludes ?? defaultUserExcludesPath(),
-		}));
-		return locations;
-	};
-
+export async function resolveCheckpointExcludes(
+	cwd: string,
+	version: number | undefined,
+): Promise<WithCheckpointExcludes> {
+	if (version === undefined) {
+		return (run) => run([]);
+	}
+	if (version !== CHECKPOINT_EXCLUSIONS_VERSION) {
+		throw new Error(
+			"This checkpoint was created by a newer version of Cline. Update Cline to restore or compare it.",
+		);
+	}
+	const content = [
+		await readUserExcludes(cwd),
+		...CHECKPOINT_DEFAULT_EXCLUDES,
+	].join("\n");
 	return async (run) => {
-		const { repoRoot, userExcludes } = await resolveLocations();
-		const [userPatterns, gitattributes] = await Promise.all([
-			readOptional(userExcludes),
-			readOptional(join(repoRoot, ".gitattributes")),
-		]);
-		const content = [
-			userPatterns,
-			...CHECKPOINT_DEFAULT_EXCLUDES,
-			...parseLfsPatterns(gitattributes),
-		].join("\n");
 		const dir = await mkdtemp(join(tmpdir(), "cline-checkpoint-excludes-"));
 		try {
 			const file = join(dir, "excludes");

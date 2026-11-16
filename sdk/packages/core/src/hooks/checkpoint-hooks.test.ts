@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AgentMessage } from "@cline/shared";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { CHECKPOINT_EXCLUSIONS_VERSION } from "./checkpoint-exclusions";
 import {
 	type CheckpointEntry,
 	type CheckpointMetadata,
@@ -949,28 +950,21 @@ describe("createCheckpointHooks", () => {
 		}
 	});
 
-	it("excludes untracked files matching Git LFS patterns from .gitattributes", async () => {
+	it("marks each checkpoint with the exclusion list it was made with", async () => {
+		// Restore and compare read this marker to apply the same list; entries
+		// without it are from before exclusions and are handled as before.
 		const cwd = await createGitRepo();
-		const sessionId = "sess_lfs_patterns";
 		try {
-			await writeFile(
-				join(cwd, ".gitattributes"),
-				"# engine assets\n*.uasset\tfilter=lfs diff=lfs merge=lfs -text\n*.md text\n",
-				"utf8",
-			);
-			await runGit(cwd, "add", ".gitattributes");
-			await runGit(cwd, "commit", "-m", "lfs attributes");
-			await writeFile(join(cwd, "hero.uasset"), "asset", "utf8");
+			const clean = await snapshotOnce(cwd, "sess_marker_clean");
+			expect(clean.kind).toBe("commit");
+			expect(clean.exclusions).toBe(CHECKPOINT_EXCLUSIONS_VERSION);
+
 			await writeFile(join(cwd, "keep.txt"), "keep\n", "utf8");
-
-			const entry = await snapshotOnce(cwd, sessionId);
-
-			expect(entry.kind).toBe("stash");
-			expect(await untrackedSnapshotPaths(cwd, entry.ref)).toEqual([
-				"keep.txt",
-			]);
+			const dirty = await snapshotOnce(cwd, "sess_marker_dirty");
+			expect(dirty.kind).toBe("stash");
+			expect(dirty.exclusions).toBe(CHECKPOINT_EXCLUSIONS_VERSION);
 		} finally {
-			await deleteCheckpointRefs(cwd, sessionId);
+			await deleteCheckpointRefs(cwd, "sess_marker_dirty");
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
@@ -996,6 +990,28 @@ describe("createCheckpointHooks", () => {
 			await deleteCheckpointRefs(cwd, sessionId);
 			await rm(cwd, { recursive: true, force: true });
 			await rm(userExcludes, { force: true });
+		}
+	});
+
+	it("resolves a relative core.excludesFile against the repository root, as git does", async () => {
+		// The host process rarely runs inside the workspace. Reading the path
+		// relative to the process would silently drop the user's patterns.
+		const cwd = await createGitRepo();
+		const sessionId = "sess_relative_user_excludes";
+		try {
+			await writeFile(join(cwd, ".git", "user-ignore"), "*.secret\n", "utf8");
+			await runGit(cwd, "config", "core.excludesFile", ".git/user-ignore");
+			await writeFile(join(cwd, "token.secret"), "hunter2", "utf8");
+			await writeFile(join(cwd, "keep.txt"), "keep\n", "utf8");
+
+			const entry = await snapshotOnce(cwd, sessionId);
+
+			expect(await untrackedSnapshotPaths(cwd, entry.ref)).toEqual([
+				"keep.txt",
+			]);
+		} finally {
+			await deleteCheckpointRefs(cwd, sessionId);
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 });

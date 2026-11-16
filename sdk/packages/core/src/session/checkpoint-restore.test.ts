@@ -5,6 +5,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -434,11 +435,10 @@ describe("applyCheckpointToWorktree", () => {
 		);
 	});
 
-	it("rewinds an excluded-type file that a checkpoint from before exclusions captured", async () => {
-		// Checkpoints created before this change can hold a .mp4 in their
-		// untracked snapshot. Now that .mp4 is excluded, cleanup leaves the
-		// current file in place, and re-creating the snapshot's copy must not
-		// fail with "already exists".
+	it("restores a checkpoint from before exclusions exactly as before", async () => {
+		// Checkpoints without the exclusions marker captured every untracked
+		// file, .mp4 included. They keep the old behaviour end to end: captured
+		// files are rewound and files created afterwards are removed.
 		writeFileSync(join(dir, "clip.mp4"), "old frames", "utf8");
 		writeFileSync(join(dir, "notes.txt"), "old notes\n", "utf8");
 		git(dir, [
@@ -456,6 +456,7 @@ describe("applyCheckpointToWorktree", () => {
 
 		writeFileSync(join(dir, "clip.mp4"), "new frames", "utf8");
 		writeFileSync(join(dir, "notes.txt"), "new notes\n", "utf8");
+		writeFileSync(join(dir, "created-after.mp4"), "later frames", "utf8");
 
 		await restoreWorkspaceThroughService(dir, {
 			ref,
@@ -466,20 +467,81 @@ describe("applyCheckpointToWorktree", () => {
 
 		expect(readFileSync(join(dir, "clip.mp4"), "utf8")).toBe("old frames");
 		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("old notes\n");
+		expect(existsSync(join(dir, "created-after.mp4"))).toBe(false);
 	});
 
-	it("restores a captured untracked file that has since become ignored", async () => {
-		// Same failure class without the defaults: a file captured by the
-		// checkpoint and ignored afterwards blocked the restore.
+	it("keeps ignored files as they are when a restore fails and rolls back", async () => {
+		// Ignored files are not in the safety snapshot, so nothing may touch
+		// them: a failed restore has no way to bring their content back.
 		writeFileSync(join(dir, "data.txt"), "v1\n", "utf8");
+		mkdirSync(join(dir, "gen"));
+		writeFileSync(join(dir, "gen", "a.txt"), "captured\n", "utf8");
 		const checkpoint = await snapshotCurrentWorktree(dir, "snap-ignore-drift");
 
-		writeFileSync(join(dir, ".git", "info", "exclude"), "data.txt\n", "utf8");
+		// Both captured paths become ignored; one turns into a directory, which
+		// makes re-creating the snapshot fail.
+		writeFileSync(
+			join(dir, ".git", "info", "exclude"),
+			"data.txt\ngen/\n",
+			"utf8",
+		);
 		writeFileSync(join(dir, "data.txt"), "v2\n", "utf8");
+		rmSync(join(dir, "gen"), { recursive: true });
+		mkdirSync(join(dir, "gen", "a.txt"), { recursive: true });
+		writeFileSync(join(dir, "gen", "a.txt", "inner.txt"), "inner\n", "utf8");
+		writeFileSync(join(dir, "tracked.txt"), "current\n", "utf8");
 
-		await restoreWorkspaceThroughService(dir, checkpoint);
+		await expect(
+			restoreWorkspaceThroughService(dir, checkpoint),
+		).rejects.toThrow();
 
-		expect(readFileSync(join(dir, "data.txt"), "utf8")).toBe("v1\n");
+		expect(readFileSync(join(dir, "data.txt"), "utf8")).toBe("v2\n");
+		expect(readFileSync(join(dir, "gen", "a.txt", "inner.txt"), "utf8")).toBe(
+			"inner\n",
+		);
+		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("current\n");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"never reaches through an ignored symlink to files outside the workspace",
+		async () => {
+			mkdirSync(join(dir, "assets"));
+			writeFileSync(join(dir, "assets", "file.txt"), "captured\n", "utf8");
+			const checkpoint = await snapshotCurrentWorktree(dir, "snap-symlink");
+
+			const outside = mkdtempSync(join(tmpdir(), "checkpoint-outside-"));
+			try {
+				writeFileSync(join(outside, "file.txt"), "external\n", "utf8");
+				rmSync(join(dir, "assets"), { recursive: true });
+				symlinkSync(outside, join(dir, "assets"));
+				writeFileSync(join(dir, ".git", "info", "exclude"), "assets\n", "utf8");
+
+				await restoreWorkspaceThroughService(dir, checkpoint).catch(
+					() => undefined,
+				);
+
+				expect(readFileSync(join(outside, "file.txt"), "utf8")).toBe(
+					"external\n",
+				);
+			} finally {
+				rmSync(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("rejects a checkpoint from a newer build before touching the worktree", async () => {
+		writeFileSync(join(dir, "untracked.txt"), "captured\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-newer-build");
+		writeFileSync(join(dir, "tracked.txt"), "current\n", "utf8");
+
+		await expect(
+			applyCheckpointToWorktree(dir, {
+				...checkpoint,
+				exclusions: (checkpoint.exclusions ?? 0) + 1,
+			}),
+		).rejects.toThrow(/newer version/);
+
+		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("current\n");
 	});
 
 	it("carries checkpoint metadata through the restored run", () => {
@@ -501,6 +563,31 @@ describe("applyCheckpointToWorktree", () => {
 
 		expect(metadata?.latest.runCount).toBe(2);
 		expect(metadata?.history.map((entry) => entry.runCount)).toEqual([1, 2]);
+	});
+
+	it("keeps the exclusions marker on restored checkpoint metadata", () => {
+		// Losing the marker would make a later restore treat the checkpoint as
+		// one that captured every untracked file, and delete the excluded ones.
+		const metadata = createRestoredCheckpointMetadata(
+			{
+				metadata: {
+					checkpoint: {
+						history: [
+							{ ref: "aaaa", createdAt: 1, runCount: 1 },
+							{ ref: "bbbb", createdAt: 2, runCount: 2, exclusions: 1 },
+							{ ref: "cccc", createdAt: 3, runCount: 3, exclusions: "1" },
+						],
+					},
+				},
+			},
+			3,
+		);
+
+		expect(metadata?.history.map((entry) => entry.exclusions)).toEqual([
+			undefined,
+			1,
+			undefined,
+		]);
 	});
 });
 

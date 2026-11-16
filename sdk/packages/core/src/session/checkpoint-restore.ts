@@ -1,10 +1,11 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
 import { promisify } from "node:util";
 import type * as LlmsProviders from "@cline/llms";
-import { createCheckpointExcludes } from "../hooks/checkpoint-exclusions";
+import {
+	readCheckpointExclusions,
+	resolveCheckpointExcludes,
+} from "../hooks/checkpoint-exclusions";
 import type {
 	CheckpointEntry,
 	CheckpointMetadata,
@@ -50,12 +51,15 @@ async function resolveOptionalGitRef(
  * its object behind a private ref, and immediately remove it from the user's
  * visible stash list. The private ref remains only until commit or rollback.
  *
- * Checkpoint-excluded files (media, dependency trees, ...) are treated as
- * ignored here, as in the snapshot: they stay in place instead of moving into
- * the safety stash, which commit discards and no restore re-creates them from.
+ * For a checkpoint made with the default exclusions, excluded files (media,
+ * dependency trees, ...) are treated as ignored here, as in its snapshot: they
+ * stay in place instead of moving into the safety stash, which commit discards
+ * and no restore re-creates them from. The rules are resolved once and shared
+ * by the safety stash and the rollback cleanups.
  */
 export async function beginWorktreeRestoreTransaction(
 	cwd: string,
+	checkpoint?: Pick<CheckpointEntry, "exclusions">,
 ): Promise<WorktreeRestoreTransaction> {
 	const check = await execFile(
 		"git",
@@ -65,7 +69,10 @@ export async function beginWorktreeRestoreTransaction(
 	if (check.stdout.trim() !== "true") {
 		throw new Error(`${cwd} is not a git repository`);
 	}
-	const withExcludes = createCheckpointExcludes(cwd);
+	const withExcludes = await resolveCheckpointExcludes(
+		cwd,
+		checkpoint?.exclusions,
+	);
 	const originalHead = (
 		await execFile("git", ["-C", cwd, "rev-parse", "--verify", "HEAD"], {
 			windowsHide: true,
@@ -199,7 +206,16 @@ export function readSessionCheckpointHistory(
 				entry.kind === "stash" || entry.kind === "commit"
 					? entry.kind
 					: undefined;
-			return [{ ref, createdAt, runCount, ...(kind ? { kind } : {}) }];
+			const exclusions = readCheckpointExclusions(entry.exclusions);
+			return [
+				{
+					ref,
+					createdAt,
+					runCount,
+					...(kind ? { kind } : {}),
+					...(exclusions ? { exclusions } : {}),
+				},
+			];
 		});
 }
 
@@ -369,46 +385,6 @@ async function checkpointCapturedUntracked(
 	}
 }
 
-/**
- * Removes whatever currently sits at the paths a snapshot's untracked parent
- * is about to re-create. `git stash apply` refuses to overwrite an existing
- * file ("already exists"), and cleanup leaves ignored files in place, so a
- * captured file that became ignored later blocked the whole restore — whether
- * through the checkpoint defaults (checkpoints made before they shipped can
- * hold a `.mp4`) or through a later `.gitignore` edit. Each removed path is
- * re-created from the snapshot immediately after. Nested-repository entries
- * (gitlinks) are skipped: git does not re-create those directories.
- */
-async function clearSnapshotUntrackedPaths(
-	cwd: string,
-	ref: string,
-): Promise<void> {
-	const listing = await execFile(
-		"git",
-		["-C", cwd, "ls-tree", "-r", "-z", `${ref}^3`],
-		{ windowsHide: true, maxBuffer: 1024 * 1024 * 64 },
-	);
-	const paths = listing.stdout
-		.split("\0")
-		.filter(Boolean)
-		.flatMap((entry) => {
-			const tab = entry.indexOf("\t");
-			if (tab < 0 || entry.startsWith("160000 ")) return [];
-			return [entry.slice(tab + 1)];
-		});
-	for (let start = 0; start < paths.length; start += 64) {
-		await Promise.all(
-			paths
-				.slice(start, start + 64)
-				// A path that is now a directory is left for `stash apply` to
-				// report with git's own message.
-				.map((path) =>
-					rm(join(cwd, path), { force: true }).catch(() => undefined),
-				),
-		);
-	}
-}
-
 /** Commits reachable from `to` but not from `from`; undefined when unknown. */
 async function countCommitsBetween(
 	cwd: string,
@@ -491,6 +467,13 @@ export async function applyCheckpointToWorktree(
 		cwd,
 		checkpoint.ref,
 	);
+	// Resolved before anything is modified: it fails for a checkpoint this
+	// build cannot restore, and the rules must describe the worktree as the
+	// safety snapshot saw it.
+	const withExcludes = await resolveCheckpointExcludes(
+		cwd,
+		checkpoint.exclusions,
+	);
 	// `git update-ref <ref> <new> <old>` is git's native compare-and-swap: it
 	// moves HEAD to the restore base only if HEAD still points at the commit
 	// verified above, closing the race between the guard check and the reset.
@@ -521,9 +504,13 @@ export async function applyCheckpointToWorktree(
 	// avoids "already exists" apply conflicts. For 2-parent stashes and
 	// HEAD-commit fallbacks (no ^3) untracked files can't be reconstructed, so
 	// they are left untouched — deleting them would be unrecoverable data loss.
-	// Checkpoint-excluded files are never snapshotted, so cleanup skips them too.
+	// Files the checkpoint's exclusion list skipped were never snapshotted, so
+	// cleanup leaves them alone like ignored ones. A captured file that became
+	// ignored afterwards still makes the apply below fail with "already
+	// exists": ignored files are outside the safety snapshot, so overwriting
+	// one could not be rolled back.
 	if (capturedUntracked) {
-		await createCheckpointExcludes(cwd)((excludeArgs) =>
+		await withExcludes((excludeArgs) =>
 			execFile("git", ["-C", cwd, ...excludeArgs, "clean", "-fd"], {
 				windowsHide: true,
 			}),
@@ -531,9 +518,6 @@ export async function applyCheckpointToWorktree(
 	}
 	if (checkpointKind === "commit") {
 		return;
-	}
-	if (capturedUntracked) {
-		await clearSnapshotUntrackedPaths(cwd, checkpoint.ref);
 	}
 	await execFile("git", ["-C", cwd, "stash", "apply", checkpoint.ref], {
 		windowsHide: true,
