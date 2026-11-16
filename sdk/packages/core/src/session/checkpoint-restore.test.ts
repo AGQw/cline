@@ -278,7 +278,7 @@ describe("applyCheckpointToWorktree", () => {
 		writeFileSync(join(dir, "untracked.md"), "v3\n", "utf8");
 		writeFileSync(join(dir, "created-after.txt"), "made later\n", "utf8");
 
-		await applyCheckpointToWorktree(dir, checkpoint);
+		await restoreWorkspaceThroughService(dir, checkpoint);
 
 		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("checkpoint\n");
 		// Untracked file modified after the checkpoint is reverted to its
@@ -299,11 +299,10 @@ describe("applyCheckpointToWorktree", () => {
 		writeFileSync(join(dir, "tracked.txt"), "later\n", "utf8");
 		writeFileSync(join(dir, "ignored.log"), "build output\n", "utf8");
 
-		await applyCheckpointToWorktree(dir, checkpoint);
+		await restoreWorkspaceThroughService(dir, checkpoint);
 
 		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("checkpoint\n");
 		expect(readFileSync(join(dir, "kept.txt"), "utf8")).toBe("keep\n");
-		// git clean -fd (no -x) never touches ignored paths.
 		expect(readFileSync(join(dir, "ignored.log"), "utf8")).toBe(
 			"build output\n",
 		);
@@ -355,6 +354,12 @@ describe("applyCheckpointToWorktree", () => {
 	});
 
 	it("rolls back HEAD plus staged, unstaged, and untracked changes", async () => {
+		// The checkpoint being restored captured replacement.txt, so the
+		// restore writes it and the rollback has to take it out again.
+		writeFileSync(join(dir, "replacement.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-replaced");
+		rmSync(join(dir, "replacement.txt"));
+
 		writeFileSync(join(dir, "tracked.txt"), "existing stash\n", "utf8");
 		git(dir, ["stash", "push", "--message", "existing user stash"]);
 		const stashListBefore = git(dir, ["stash", "list"]);
@@ -365,7 +370,7 @@ describe("applyCheckpointToWorktree", () => {
 		writeFileSync(join(dir, "tracked.txt"), "unstaged state\n", "utf8");
 		writeFileSync(join(dir, "untracked.txt"), "untracked state\n", "utf8");
 
-		const transaction = await beginWorktreeRestoreTransaction(dir);
+		const transaction = await beginWorktreeRestoreTransaction(dir, checkpoint);
 		expect(git(dir, ["status", "--short"])).toBe("");
 		expect(git(dir, ["stash", "list"])).toBe(stashListBefore);
 
@@ -400,7 +405,12 @@ describe("applyCheckpointToWorktree", () => {
 		writeFileSync(join(dir, "untracked.txt"), "discarded untracked\n", "utf8");
 		const stashListBefore = git(dir, ["stash", "list"]);
 
-		const transaction = await beginWorktreeRestoreTransaction(dir);
+		const transaction = await beginWorktreeRestoreTransaction(dir, {
+			ref: git(dir, ["rev-parse", "HEAD"]),
+			createdAt: Date.now(),
+			runCount: 1,
+			kind: "commit",
+		});
 		await transaction.commit();
 
 		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("base\n");
@@ -529,13 +539,203 @@ describe("applyCheckpointToWorktree", () => {
 		},
 	);
 
+	it("keeps a file that only an uncommitted .gitignore rule ignores", async () => {
+		// The safety snapshot reverts the .gitignore edit, so the rule is gone
+		// for the rest of the restore. The file has no copy anywhere.
+		writeFileSync(join(dir, ".gitignore"), "*.tmp\n", "utf8");
+		git(dir, ["add", ".gitignore"]);
+		git(dir, ["commit", "-m", "add gitignore"]);
+		writeFileSync(join(dir, "notes.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-rule-edit");
+
+		writeFileSync(join(dir, ".gitignore"), "*.tmp\nsecret.env\n", "utf8");
+		writeFileSync(join(dir, "secret.env"), "KEY=1\n", "utf8");
+		writeFileSync(join(dir, "notes.txt"), "later\n", "utf8");
+		writeFileSync(join(dir, "created-after.txt"), "remove me\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, "secret.env"), "utf8")).toBe("KEY=1\n");
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("*.tmp\n");
+		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("checkpoint\n");
+		expect(existsSync(join(dir, "created-after.txt"))).toBe(false);
+	});
+
+	it("keeps ignored files when the .gitignore itself is untracked", async () => {
+		// The safety snapshot takes the untracked .gitignore away, so everything
+		// it ignored looks like a plain untracked file until the checkpoint
+		// brings the .gitignore back.
+		writeFileSync(join(dir, ".gitignore"), "deps/\n.env\n", "utf8");
+		mkdirSync(join(dir, "deps"));
+		writeFileSync(join(dir, "deps", "lib.js"), "lib\n", "utf8");
+		writeFileSync(join(dir, ".env"), "KEY=1\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-new-ignore");
+
+		writeFileSync(join(dir, "tracked.txt"), "later\n", "utf8");
+		writeFileSync(join(dir, "created-after.txt"), "remove me\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, ".env"), "utf8")).toBe("KEY=1\n");
+		expect(readFileSync(join(dir, "deps", "lib.js"), "utf8")).toBe("lib\n");
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("deps/\n.env\n");
+		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("base\n");
+		expect(existsSync(join(dir, "created-after.txt"))).toBe(false);
+	});
+
+	it("keeps an excluded file when the committed .gitignore un-ignores its pattern", async () => {
+		// The worktree dropped a committed `!*.mp4`, so the default exclusion
+		// keeps the video out of the safety snapshot. Reverting .gitignore
+		// brings the negation back, and it outranks the exclusion.
+		writeFileSync(join(dir, ".gitignore"), "!*.mp4\n", "utf8");
+		git(dir, ["add", ".gitignore"]);
+		git(dir, ["commit", "-m", "allow videos"]);
+		writeFileSync(join(dir, "notes.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-negation");
+
+		writeFileSync(join(dir, ".gitignore"), "# videos no longer allowed\n");
+		writeFileSync(join(dir, "recording.mp4"), "video bytes", "utf8");
+		writeFileSync(join(dir, "notes.txt"), "later\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, "recording.mp4"), "utf8")).toBe(
+			"video bytes",
+		);
+		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("checkpoint\n");
+	});
+
+	it("rolls back without deleting files whose ignore rule the restore reverted", async () => {
+		writeFileSync(join(dir, ".gitignore"), "deps/\n.env\n", "utf8");
+		mkdirSync(join(dir, "deps"));
+		writeFileSync(join(dir, "deps", "lib.js"), "lib\n", "utf8");
+		writeFileSync(join(dir, ".env"), "KEY=1\n", "utf8");
+		mkdirSync(join(dir, "gen"));
+		writeFileSync(join(dir, "gen", "out.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-rollback");
+
+		writeFileSync(join(dir, ".gitignore"), "deps/\n.env\nlocal.cfg\n", "utf8");
+		writeFileSync(join(dir, "local.cfg"), "mine\n", "utf8");
+		rmSync(join(dir, "gen"), { recursive: true });
+		writeFileSync(join(dir, "tracked.txt"), "later\n", "utf8");
+		writeFileSync(join(dir, "created-after.txt"), "keep me\n", "utf8");
+
+		const transaction = await beginWorktreeRestoreTransaction(dir, checkpoint);
+		await applyCheckpointToWorktree(dir, checkpoint);
+		await transaction.rollback();
+
+		expect(readFileSync(join(dir, ".env"), "utf8")).toBe("KEY=1\n");
+		expect(readFileSync(join(dir, "deps", "lib.js"), "utf8")).toBe("lib\n");
+		expect(readFileSync(join(dir, "local.cfg"), "utf8")).toBe("mine\n");
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe(
+			"deps/\n.env\nlocal.cfg\n",
+		);
+		expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("later\n");
+		expect(readFileSync(join(dir, "created-after.txt"), "utf8")).toBe(
+			"keep me\n",
+		);
+		// The checkpoint's own files are taken out again, directory included.
+		expect(existsSync(join(dir, "gen"))).toBe(false);
+	});
+
+	it("still rewinds a captured file that an uncommitted rule ignores now", async () => {
+		writeFileSync(join(dir, ".gitignore"), "*.tmp\n", "utf8");
+		git(dir, ["add", ".gitignore"]);
+		git(dir, ["commit", "-m", "add gitignore"]);
+		writeFileSync(join(dir, "notes.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-captured");
+
+		writeFileSync(join(dir, ".gitignore"), "*.tmp\nnotes.txt\n", "utf8");
+		writeFileSync(join(dir, "notes.txt"), "later\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("checkpoint\n");
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("*.tmp\n");
+	});
+
+	it("leaves a captured nested repository in place", async () => {
+		mkdirSync(join(dir, "vendor-lib"));
+		createRepo(join(dir, "vendor-lib"));
+		writeFileSync(join(dir, "notes.txt"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-nested-repo");
+
+		writeFileSync(join(dir, "notes.txt"), "later\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("checkpoint\n");
+		expect(readFileSync(join(dir, "vendor-lib", "tracked.txt"), "utf8")).toBe(
+			"base\n",
+		);
+		expect(git(join(dir, "vendor-lib"), ["status", "--short"])).toBe("");
+	});
+
+	it("rewinds a captured file that is ignored now", async () => {
+		writeFileSync(join(dir, "config.local"), "checkpoint\n", "utf8");
+		const checkpoint = await snapshotCurrentWorktree(dir, "snap-now-ignored");
+
+		writeFileSync(join(dir, ".git", "info", "exclude"), "config.local\n");
+		writeFileSync(join(dir, "config.local"), "later\n", "utf8");
+
+		await restoreWorkspaceThroughService(dir, checkpoint);
+
+		expect(readFileSync(join(dir, "config.local"), "utf8")).toBe(
+			"checkpoint\n",
+		);
+	});
+
+	describe("a captured file that the exclusions cover now", () => {
+		// An uncommitted `!*.mp4` let the checkpoint capture the video. With the
+		// negation gone the video is excluded, so the safety stash skips it.
+		let checkpoint: CheckpointEntry;
+
+		beforeEach(async () => {
+			writeFileSync(join(dir, ".gitignore"), "!*.mp4\n", "utf8");
+			writeFileSync(join(dir, "clip.mp4"), "checkpoint frames", "utf8");
+			checkpoint = await snapshotCurrentWorktree(dir, "snap-negated");
+			expect(
+				git(dir, ["ls-tree", "-r", "--name-only", `${checkpoint.ref}^3`]),
+			).toContain("clip.mp4");
+
+			rmSync(join(dir, ".gitignore"));
+			writeFileSync(join(dir, "clip.mp4"), "later frames", "utf8");
+			writeFileSync(join(dir, "tracked.txt"), "later\n", "utf8");
+		});
+
+		it("is rewound by a restore", async () => {
+			await restoreWorkspaceThroughService(dir, checkpoint);
+
+			expect(readFileSync(join(dir, "clip.mp4"), "utf8")).toBe(
+				"checkpoint frames",
+			);
+			expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("!*.mp4\n");
+		});
+
+		it("comes back when the restore is rolled back", async () => {
+			// The checkpoint's .gitignore un-ignores the video while it is in
+			// the worktree; the rollback must not take that as a reason to
+			// delete it.
+			const transaction = await beginWorktreeRestoreTransaction(
+				dir,
+				checkpoint,
+			);
+			await applyCheckpointToWorktree(dir, checkpoint);
+			await transaction.rollback();
+
+			expect(readFileSync(join(dir, "clip.mp4"), "utf8")).toBe("later frames");
+			expect(readFileSync(join(dir, "tracked.txt"), "utf8")).toBe("later\n");
+			expect(existsSync(join(dir, ".gitignore"))).toBe(false);
+		});
+	});
+
 	it("rejects a checkpoint from a newer build before touching the worktree", async () => {
 		writeFileSync(join(dir, "untracked.txt"), "captured\n", "utf8");
 		const checkpoint = await snapshotCurrentWorktree(dir, "snap-newer-build");
 		writeFileSync(join(dir, "tracked.txt"), "current\n", "utf8");
 
 		await expect(
-			applyCheckpointToWorktree(dir, {
+			restoreWorkspaceThroughService(dir, {
 				...checkpoint,
 				exclusions: (checkpoint.exclusions ?? 0) + 1,
 			}),
